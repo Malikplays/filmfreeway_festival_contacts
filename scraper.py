@@ -1,15 +1,37 @@
-import time
-import scraperwiki  # creates ./data.sqlite on save
+import time, sqlite3
 
-row = {
-    "source_url": "https://filmfreeway.com/ExampleFestival",
-    "name": "Example Festival",
-    "website": "https://examplefest.org",
-    "email": "info@examplefest.org",
-    "director": "Jane Doe",
-    "location": "City, Country",
-    "scraped_at": int(time.time()),
-}
+conn = sqlite3.connect('data.sqlite')
+cur = conn.cursor()
 
-scraperwiki.sqlite.save(unique_keys=["source_url"], data=row)
+cur.execute("""
+CREATE TABLE IF NOT EXISTS festivals (
+  source_url TEXT PRIMARY KEY,
+  name TEXT,
+  website TEXT,
+  email TEXT,
+  director TEXT,
+  location TEXT,
+  scraped_at INTEGER
+)
+""")
+
+row = (
+  "https://filmfreeway.com/ExampleFestival",
+  "Example Festival",
+  "https://examplefest.org",
+  "info@examplefest.org",
+  "Jane Doe",
+  "City, Country",
+  int(time.time())
+)
+
+cur.execute("""
+INSERT OR REPLACE INTO festivals
+(source_url, name, website, email, director, location, scraped_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+""", row)
+
+conn.commit()
+conn.close()
+
 print("Wrote 1 test row to data.sqlite")
