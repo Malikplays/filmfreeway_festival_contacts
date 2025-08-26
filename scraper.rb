@@ -141,14 +141,14 @@ def http_get(url, referer: "https://filmfreeway.com/")
   [:no_render, :render].each do |mode|
     target = scraperapi_url(url, mode: mode)
     begin
-      return timed_request(target, referer: "https://filmfreeway.com/")
+      return timed_request(target, referer: referer)
     rescue => e
       STDERR.puts "… #{mode} failed: #{e}"
       if e.to_s =~ /HTTP (429|5\d\d)|Timeout/
         sleep 1.0
         STDERR.puts "Retrying #{mode} once…"
         begin
-          return timed_request(target, referer: "https://filmfreeway.com/")
+          return timed_request(target, referer: referer)
         rescue => e2
           STDERR.puts "… retry failed: #{e2}"
         end
@@ -162,7 +162,7 @@ def http_get_rendered(url)
   timed_request(scraperapi_url(url, mode: :render), referer: "https://filmfreeway.com/")
 end
 
-# ====== Parsing helpers (label-precise) ======
+# ====== Parsing helpers ======
 SOCIAL = %w[facebook.com twitter.com instagram.com youtube.com tiktok.com linkedin.com linktr.ee]
 
 def absolute(base, href)
@@ -184,15 +184,13 @@ def container_for_label(doc, label)
   strong = doc.at_xpath("//*[self::strong or self::b][#{down}='#{label.downcase}']")
   return (strong.ancestors('li,div,section,p,dd').first || strong.parent) if strong
 
-  # generic element with exact label text → return nearest container
+  # generic element with exact label text → nearest container
   lbl = doc.at_xpath("//*[self::div or self::span or self::p or self::li][#{down}='#{label.downcase}']")
   return (lbl.ancestors('li,div,section,p,dd').first || lbl.parent) if lbl
 
-  # final: any node that contains the word as a separate token
+  # final: any node that contains the word
   contains = doc.at_xpath("//*[contains(#{down},'#{label.downcase}')]")
-  if contains
-    return contains.ancestors('li,div,section,p,dd').first || contains.parent
-  end
+  return (contains.ancestors('li,div,section,p,dd').first || contains.parent) if contains
 
   nil
 end
@@ -206,7 +204,7 @@ def value_text_from_container(container, label)
   txt.empty? ? nil : txt
 end
 
-# Find <a> by visible text (case-insensitive). Exact match then contains.
+# <a> by visible text (case-insensitive)
 def at_link_by_text(doc, label)
   down = "translate(normalize-space(string(.)),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')"
   doc.at_xpath("//a[@href and #{down}='#{label.downcase}']") ||
@@ -228,4 +226,166 @@ def extract_url_from_attrs(node)
     data-copy data-copy-text data-contact data-user data-domain data-href data-url
   ].each do |attr|
     v = node[attr]
-    next unless
+    next unless v && !v.empty?
+    return "mailto:#{v}" if v =~ /\A[^@\s]+@[^@\s]+\.[^@\s]+\z/
+    return v if v =~ /\Ahttps?:\/\//i
+  end
+  nil
+end
+
+def website_from_label(doc, page_url)
+  cont = container_for_label(doc, 'website')
+  return nil unless cont
+
+  link = cont.at_css('a[href]')
+  if link
+    href = extract_url_from_attrs(link) || link['href'].to_s
+    full = absolute(page_url, href)
+    return nil unless full && full.start_with?('http')
+    return nil if full.include?('filmfreeway.com') || SOCIAL.any? { |s| full.include?(s) }
+    return full
+  end
+
+  # fallback: an <a> whose text says "Website"
+  a = at_link_by_text(doc, 'website')
+  if a
+    href = extract_url_from_attrs(a) || a['href'].to_s
+    full = absolute(page_url, href)
+    if full && full.start_with?('http') &&
+       !full.include?('filmfreeway.com') &&
+       SOCIAL.none? { |s| full.include?(s) }
+      return full
+    end
+  end
+
+  nil
+end
+
+def collect_attr_candidates(node)
+  vals = []
+  node.traverse do |n|
+    n.attribute_nodes.each do |att|
+      vals << att.value if att.value && !att.value.empty?
+    end
+  end
+  node.xpath(".. | ../..").each do |n|
+    n.attribute_nodes.each do |att|
+      vals << att.value if att.value && !att.value.empty?
+    end
+  end
+  vals.compact.uniq
+end
+
+def parse_email_from(strings)
+  strings.each do |s|
+    if s =~ /mailto:([^\s'")<>]+)/i
+      return $1.strip
+    end
+    m = s[/[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}/i]
+    return m.strip if m
+  end
+  nil
+end
+
+def email_from_label(doc, page_url)
+  cont = container_for_label(doc, 'email')
+  return nil unless cont
+
+  # 1) direct mailto or data-* within container
+  direct = cont.at_css("a[href^='mailto:']")
+  return direct['href'].sub(/^mailto:/i,'').strip if direct
+
+  email = parse_email_from(collect_attr_candidates(cont))
+  return email if email
+
+  # 2) JS decoy → fetch rendered and re-scan the SAME container
+  a2 = cont.at_css('a[href]')
+  if a2 && a2['href'].to_s.include?('#ff_javascript')
+    html2 = http_get_rendered(page_url)
+    doc2  = Nokogiri::HTML(html2)
+    cont2 = container_for_label(doc2, 'email')
+    if cont2
+      direct2 = cont2.at_css("a[href^='mailto:']")
+      return direct2['href'].sub(/^mailto:/i,'').strip if direct2
+      email2 = parse_email_from(collect_attr_candidates(cont2))
+      return email2 if email2
+      m = cont2.text.match(/[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}/i)
+      return m[0] if m
+    end
+  end
+
+  # 3) absolute last resort (page-level mailto)
+  any = doc.at_css("a[href^='mailto:']")
+  return any['href'].sub(/^mailto:/i,'').strip if any
+
+  nil
+end
+
+def location_from_label(doc)
+  cont = container_for_label(doc, 'location')
+  value_text_from_container(cont, 'location')
+end
+
+def phone_from_label(doc)
+  cont = container_for_label(doc, 'phone')
+  val = value_text_from_container(cont, 'phone')
+  return val if val && !val.empty?
+
+  tel = cont&.at_css("a[href^='tel:']")
+  return tel.text.strip if tel
+
+  if cont
+    m = cont.text.match(/(\+?\d[\d\-\s().]{6,}\d)/)
+    return m[1] if m
+  end
+
+  nil
+end
+
+def director_guess(doc)
+  doc.xpath("//*[contains(translate(.,'DIRECTOR','director'),'director')]")
+     .map { |n| n.text.strip }
+     .find { |t| t =~ /director/i }
+end
+
+# ====== Scrape one festival page ======
+def scrape_festival(url)
+  html = http_get(url, referer: "https://filmfreeway.com/festivals")
+  doc  = Nokogiri::HTML(html)
+
+  name = doc.at('h1')&.text&.strip
+  name ||= doc.at('title')&.text&.strip
+
+  website  = website_from_label(doc, url)   # href inside "Website" block
+  email    = email_from_label(doc, url)     # from "Email" block (handles JS)
+  location = location_from_label(doc)       # visible text only
+  phone    = phone_from_label(doc)          # visible text only
+  director = director_guess(doc)            # best-effort text
+
+  upsert_row({
+    source_url: url,
+    name: name,
+    website: website,
+    email: email,
+    director: director,
+    location: location,
+    phone: phone
+  })
+end
+
+# ====== Run (replace SEEDS with your list) ======
+SEEDS = [
+  "https://filmfreeway.com/CommffestGlobalCommunityFilmFestival"
+]
+
+SEEDS.each do |u|
+  begin
+    scrape_festival(u)
+    puts "OK #{u}"
+    sleep 1
+  rescue => e
+    warn "FAIL #{u} -> #{e}"
+  end
+end
+
+puts "done"
