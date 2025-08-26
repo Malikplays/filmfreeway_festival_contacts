@@ -32,7 +32,7 @@ def ensure_table!
     );
   SQL
 
-  # Remove any legacy columns
+  # Remove legacy/extra columns if present
   cols_now   = db.execute("PRAGMA table_info(festivals)").map { |r| r[1] }
   extra_cols = cols_now - DESIRED_COLS
   if extra_cols.any?
@@ -85,9 +85,7 @@ def scraperapi_url(target_url, mode: :no_render, country: 'us', session: 1001)
   uri.to_s
 end
 
-def mask_key(u)
-  u.to_s.sub(/api_key=[^&]+/, 'api_key=***')
-end
+def mask_key(u) u.to_s.sub(/api_key=[^&]+/, 'api_key=***') end
 
 def decompress(body, encoding)
   case (encoding || "").downcase
@@ -152,7 +150,7 @@ def http_get_rendered(url)
 end
 
 # ====== DOM helpers ======
-BLOCKY_CLASSES  = /(Modal|modal|Overlay|Dialog|Signup|Login|StrongPassword|cookie|vex_)/i
+BLOCKY_CLASSES = /(Modal|modal|Overlay|Dialog|Signup|Login|StrongPassword|cookie|vex_)/i
 
 def absolute(base, href)
   return nil if href.nil? || href.empty?
@@ -163,8 +161,8 @@ end
 
 def small_container(node)
   return nil unless node
-  node.ancestors('dd').first ||
-    node.ancestors('li').first ||
+  node.ancestors('li').first ||
+    node.ancestors('dd').first ||
     node.ancestors('div').find { |d| (d['class'].to_s !~ BLOCKY_CLASSES) && d.inner_html.size < 4000 } ||
     node.ancestors('section').find { |s| s.inner_html.size < 4000 } ||
     node
@@ -189,18 +187,29 @@ def looks_like_noise?(s)
   false
 end
 
-# ====== WEBSITE (exact href from title="Visit website") ======
+# ====== WEBSITE (exact href from the row that contains the globe icon) ======
 def website_from_page(doc, page_url)
-  # Priority 1: exact title="Visit website"
-  a = doc.at_css("a[title='Visit website'][href]")
-  # Priority 1b: case-insensitive contains on @title / @aria-label
-  a ||= doc.at_xpath("//a[@href and contains(translate(@title,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'visit website')]")
-  a ||= doc.at_xpath("//a[@href and contains(translate(@aria-label,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'visit website')]")
-  # Priority 2: visible text equals "Website"
-  a ||= doc.at_xpath("//a[@href and normalize-space(translate(string(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'))='website']")
+  # 1) Prefer the same row/container that includes the <span class="icon icon-globe">
+  globe = doc.at_css("span.icon.icon-globe") || doc.at_xpath("//span[contains(@class,'icon') and contains(@class,'icon-globe')]")
+  if globe
+    row = small_container(globe) || globe.parent
+    if row
+      # Exact title first
+      a = row.at_css("a[title='Visit website'][href]") ||
+          row.at_xpath(".//a[@href and contains(translate(@title,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'visit website')]") ||
+          row.at_xpath(".//a[@href and normalize-space(translate(string(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'))='website']")
+      a ||= row.at_css("a[href]") # ultimate fallback within the same row
+      return absolute(page_url, a['href'].to_s) if a
+    end
+  end
 
-  return nil unless a
-  absolute(page_url, a['href'].to_s) # return the exact href (fbclid/utm preserved)
+  # 2) Fall back to global search if icon container wasn’t found
+  a = doc.at_css("a[title='Visit website'][href]") ||
+      doc.at_xpath("//a[@href and contains(translate(@title,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'visit website')]") ||
+      doc.at_xpath("//a[@href and normalize-space(translate(string(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'))='website']")
+  return absolute(page_url, a['href'].to_s) if a
+
+  nil
 end
 
 # ====== LOCATION (visible address text only) ======
@@ -221,20 +230,16 @@ end
 def location_from_page(doc)
   node = find_label_node(doc, 'Location')
   cont = small_container(node)
-
   candidates = []
-  if cont
-    candidates << text_only_from(cont)
-  end
+  candidates << text_only_from(cont) if cont
 
-  # Fallback: sometimes address is under Contact
+  # Fallback: sometimes in a "Contact" block
   node2 = find_label_node(doc, 'Contact', 'Contact Email')
   cont2 = small_container(node2)
   candidates << text_only_from(cont2) if cont2
 
   candidates.compact!
-  # remove phone-like strings
-  candidates.map! { |t| t.gsub(/\+?\d[\d\-\s().]{6,}\d/, '').gsub(/\s+/, ' ').strip }
+  candidates.map! { |t| t.gsub(/\+?\d[\d\-\s().]{6,}\d/, '').gsub(/\s+/, ' ').strip } # drop phone-like digits
   pick = candidates.find { |t| t =~ /\d/ && t =~ /(st|street|ave|avenue|rd|road|blvd|square|plaza|drive|dr|suite|#|zip|postal|m[0-9][a-z]\s?[0-9][a-z][0-9]|canada|usa|uk|city|toronto)\b/i }
   pick ||= candidates.find { |t| t.length.between?(10, 200) }
   return nil if pick && pick.length > 220
@@ -265,7 +270,7 @@ def scrape_festival(url)
   name = doc.at('h1')&.text&.strip
   name ||= doc.at('title')&.text&.strip
 
-  website  = website_from_page(doc, url)   # exact href from "Visit website"
+  website  = website_from_page(doc, url)   # exact href from the globe-row link
   location = location_from_page(doc)       # address text only
   phone    = phone_from_page(doc)
 
@@ -284,9 +289,8 @@ end
 
 # ====== Run ======
 SEEDS = [
-  # Example: Commffest
+  # Your examples
   "https://filmfreeway.com/CommffestGlobalCommunityFilmFestival",
-  # Example you mentioned with title="Visit website"
   "https://filmfreeway.com/InternationalMediaFestivalOfWales"
 ]
 
