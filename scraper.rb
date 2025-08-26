@@ -34,7 +34,7 @@ def ensure_table!
     );
   SQL
 
-  # migrate away any extra columns (e.g., scraped_at)
+  # Drop any extra columns (e.g., scraped_at)
   cols = db.execute("PRAGMA table_info(festivals)").map { |r| r[1] }
   extra = cols - DESIRED_COLS
   if extra.any?
@@ -66,7 +66,6 @@ def db
   @db ||= ensure_table!
 end
 
-# Upsert using only existing columns
 def upsert_row(row_hash)
   cols_existing = db.execute("PRAGMA table_info(festivals)").map { |r| r[1] }
   cols = DESIRED_COLS & cols_existing
@@ -76,7 +75,7 @@ def upsert_row(row_hash)
   db.execute(sql, vals)
 end
 
-# ====== ScraperAPI helpers ======
+# ====== ScraperAPI HTTP ======
 def scraperapi_url(target_url, mode: :no_render, country: 'us', session: 1001)
   base = "https://api.scraperapi.com/"
   params = {
@@ -91,19 +90,13 @@ def scraperapi_url(target_url, mode: :no_render, country: 'us', session: 1001)
   uri.to_s
 end
 
-def mask_key(u)
-  u.to_s.sub(/api_key=[^&]+/, 'api_key=***')
-end
+def mask_key(u) u.to_s.sub(/api_key=[^&]+/, 'api_key=***') end
 
 def decompress(body, encoding)
   case (encoding || "").downcase
-  when 'gzip'
-    Zlib::GzipReader.new(StringIO.new(body)).read
-  when 'deflate'
-    Zlib::Inflate.inflate(body)
-  else
-    body
-  end
+  when 'gzip'   then Zlib::GzipReader.new(StringIO.new(body)).read
+  when 'deflate' then Zlib::Inflate.inflate(body)
+  else body end
 end
 
 def timed_request(target, referer:)
@@ -119,7 +112,6 @@ def timed_request(target, referer:)
 
   start = Time.now
   res = nil
-
   STDERR.puts "GET via ScraperAPI: #{mask_key(uri)}"
   Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == 'https') do |h|
     h.open_timeout = OPEN_TIMEOUT
@@ -127,28 +119,24 @@ def timed_request(target, referer:)
     res = h.request(req)
     raise "Timeout after #{PER_REQ_CAP}s for #{uri}" if (Time.now - start) > PER_REQ_CAP
   end
-
   code = res.code.to_i
   raise "HTTP #{code}" if code >= 400
-
   body = decompress(res.body, res['content-encoding'])
   STDERR.puts "✓ #{mask_key(uri)} (#{(Time.now - start).round(1)}s)"
   body
 end
 
-# Try no-render first (faster), then render (handles JS)
 def http_get(url, referer: "https://filmfreeway.com/")
   [:no_render, :render].each do |mode|
-    target = scraperapi_url(url, mode: mode)
     begin
-      return timed_request(target, referer: referer)
+      return timed_request(scraperapi_url(url, mode: mode), referer: referer)
     rescue => e
       STDERR.puts "… #{mode} failed: #{e}"
       if e.to_s =~ /HTTP (429|5\d\d)|Timeout/
         sleep 1.0
         STDERR.puts "Retrying #{mode} once…"
         begin
-          return timed_request(target, referer: referer)
+          return timed_request(scraperapi_url(url, mode: mode), referer: referer)
         rescue => e2
           STDERR.puts "… retry failed: #{e2}"
         end
@@ -162,8 +150,9 @@ def http_get_rendered(url)
   timed_request(scraperapi_url(url, mode: :render), referer: "https://filmfreeway.com/")
 end
 
-# ====== Parsing helpers ======
+# ====== DOM helpers ======
 SOCIAL = %w[facebook.com twitter.com instagram.com youtube.com tiktok.com linkedin.com linktr.ee]
+BLOCKY_CLASSES = /Modal|modal|Overlay|Dialog|Signup|Login|StrongPassword|cookie/i
 
 def absolute(base, href)
   return nil if href.nil? || href.empty?
@@ -172,90 +161,72 @@ rescue
   href
 end
 
-# Find the smallest useful container that holds a label and its value/controls
-def container_for_label(doc, label)
-  down = "translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')"
-
-  # <dt>Label</dt> <dd>...</dd>
-  dt = doc.at_xpath("//dt[#{down}='#{label.downcase}']")
-  return dt.xpath("following-sibling::*[1]").first if dt
-
-  # <strong>/<b>Label</strong> VALUE
-  strong = doc.at_xpath("//*[self::strong or self::b][#{down}='#{label.downcase}']")
-  return (strong.ancestors('li,div,section,p,dd').first || strong.parent) if strong
-
-  # generic element with exact label text → nearest container
-  lbl = doc.at_xpath("//*[self::div or self::span or self::p or self::li][#{down}='#{label.downcase}']")
-  return (lbl.ancestors('li,div,section,p,dd').first || lbl.parent) if lbl
-
-  # final: any node that contains the word
-  contains = doc.at_xpath("//*[contains(#{down},'#{label.downcase}')]")
-  return (contains.ancestors('li,div,section,p,dd').first || contains.parent) if contains
-
-  nil
+def small_container(node)
+  return nil unless node
+  # prefer dd/li/div/section nearby instead of large ancestors
+  node.ancestors('dd').first ||
+    node.ancestors('li').first ||
+    node.ancestors('div').find { |d| (d['class'].to_s !~ BLOCKY_CLASSES) && d.inner_html.size < 5000 } ||
+    node.ancestors('section').find { |s| s.inner_html.size < 5000 } ||
+    node
 end
 
-# Visible text in the container, minus the label word itself
-def value_text_from_container(container, label)
-  return nil unless container
-  txt = container.text.strip
-  txt = txt.gsub(/#{Regexp.escape(label)}\s*[:\-–—]?\s*/i, '')
-  txt = txt.gsub(/\s+/, ' ').strip
-  txt.empty? ? nil : txt
-end
-
-# <a> by visible text (case-insensitive)
-def at_link_by_text(doc, label)
-  down = "translate(normalize-space(string(.)),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')"
-  doc.at_xpath("//a[@href and #{down}='#{label.downcase}']") ||
-    doc.at_xpath("//a[@href and contains(#{down},'#{label.downcase}')]")
-end
-
-# Extract URL/email from JS-y attributes when href is a placeholder
-def extract_url_from_attrs(node)
-  if node['onclick']
-    if node['onclick'] =~ /mailto:([^\s'")<>]+)/i
-      return "mailto:#{$1}"
-    end
-    if node['onclick'] =~ /https?:\/\/[^\s'"]+/i
-      return node['onclick'][/https?:\/\/[^\s'"]+/i]
-    end
-  end
-  %w[
-    data-clipboard-text data-email data-address data-mail data-mailto data-text data-value
-    data-copy data-copy-text data-contact data-user data-domain data-href data-url
-  ].each do |attr|
-    v = node[attr]
-    next unless v && !v.empty?
-    return "mailto:#{v}" if v =~ /\A[^@\s]+@[^@\s]+\.[^@\s]+\z/
-    return v if v =~ /\Ahttps?:\/\//i
+def find_label_node(doc, *labels)
+  labels.each do |label|
+    down = "translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')"
+    # dt text
+    n = doc.at_xpath("//dt[#{down}='#{label.downcase}']")
+    return n if n
+    # strong/b label
+    n = doc.at_xpath("//*[self::strong or self::b][#{down}='#{label.downcase}']")
+    return n if n
+    # exact text in span/div/li/p
+    n = doc.at_xpath("//*[self::div or self::span or self::p or self::li][#{down}='#{label.downcase}']")
+    return n if n
+    # contains
+    n = doc.at_xpath("//*[contains(#{down},'#{label.downcase}')]")
+    return n if n
   end
   nil
 end
 
-def website_from_label(doc, page_url)
-  cont = container_for_label(doc, 'website')
+def looks_like_noise?(s)
+  return true if s.nil? || s.empty?
+  return true if s.size > 1000
+  return true if s.include?('{"user_signed_in"') || s.include?('fonts_to_prefetch') || s.include?('ModalLogin') || s.include?('StrongPassword')
+  false
+end
+
+def sanitize_website(u)
+  return nil unless u && u.start_with?('http')
+  host = URI(u).host rescue nil
+  return nil unless host
+  bad = (%w[filmfreeway.com static-assets.filmfreeway.com fonts.gstatic.com] + SOCIAL)
+  return nil if bad.any? { |b| host.include?(b) }
+  u
+end
+
+# ====== Field extractors ======
+def website_from_page(doc, page_url)
+  node = find_label_node(doc, 'Website')
+  cont = small_container(node)
   return nil unless cont
 
-  link = cont.at_css('a[href]')
-  if link
-    href = extract_url_from_attrs(link) || link['href'].to_s
-    full = absolute(page_url, href)
-    return nil unless full && full.start_with?('http')
-    return nil if full.include?('filmfreeway.com') || SOCIAL.any? { |s| full.include?(s) }
-    return full
+  # First, any anchor *in the same container* that is not social/filmfreeway
+  cont.css('a[href]').each do |a|
+    next if a.text.strip =~ /\A(Facebook|Instagram|Twitter|X|YouTube|LinkedIn)\z/i
+    href = a['href'].to_s
+    href = absolute(page_url, href)
+    href = sanitize_website(href)
+    return href if href
   end
 
-  # fallback: an <a> whose text says "Website"
-  a = at_link_by_text(doc, 'website')
+  # Fallback: any <a> whose visible text is exactly "Website"
+  a = doc.at_xpath("//a[normalize-space(text())='Website' or contains(normalize-space(.),'Website')][@href]")
   if a
-    href = extract_url_from_attrs(a) || a['href'].to_s
-    full = absolute(page_url, href)
-    if full && full.start_with?('http') &&
-       !full.include?('filmfreeway.com') &&
-       SOCIAL.none? { |s| full.include?(s) }
-      return full
-    end
+    href = absolute(page_url, a['href'].to_s)
+    href = sanitize_website(href)
+    return href if href
   end
 
   nil
@@ -264,14 +235,10 @@ end
 def collect_attr_candidates(node)
   vals = []
   node.traverse do |n|
-    n.attribute_nodes.each do |att|
-      vals << att.value if att.value && !att.value.empty?
-    end
+    n.attribute_nodes.each { |att| vals << att.value if att.value && !att.value.empty? }
   end
   node.xpath(".. | ../..").each do |n|
-    n.attribute_nodes.each do |att|
-      vals << att.value if att.value && !att.value.empty?
-    end
+    n.attribute_nodes.each { |att| vals << att.value if att.value && !att.value.empty? }
   end
   vals.compact.uniq
 end
@@ -287,58 +254,85 @@ def parse_email_from(strings)
   nil
 end
 
-def email_from_label(doc, page_url)
-  cont = container_for_label(doc, 'email')
+def email_from_page(doc, page_url)
+  node = find_label_node(doc, 'Email', 'Contact Email', 'Contact')
+  cont = small_container(node)
   return nil unless cont
 
-  # 1) direct mailto or data-* within container
-  direct = cont.at_css("a[href^='mailto:']")
-  return direct['href'].sub(/^mailto:/i,'').strip if direct
-
-  email = parse_email_from(collect_attr_candidates(cont))
-  return email if email
-
-  # 2) JS decoy → fetch rendered and re-scan the SAME container
-  a2 = cont.at_css('a[href]')
-  if a2 && a2['href'].to_s.include?('#ff_javascript')
-    html2 = http_get_rendered(page_url)
-    doc2  = Nokogiri::HTML(html2)
-    cont2 = container_for_label(doc2, 'email')
-    if cont2
-      direct2 = cont2.at_css("a[href^='mailto:']")
-      return direct2['href'].sub(/^mailto:/i,'').strip if direct2
-      email2 = parse_email_from(collect_attr_candidates(cont2))
-      return email2 if email2
-      m = cont2.text.match(/[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}/i)
-      return m[0] if m
-    end
+  # 1) direct mailto in the block
+  if (m = cont.at_css("a[href^='mailto:']"))
+    return m['href'].sub(/^mailto:/i,'').strip
   end
 
-  # 3) absolute last resort (page-level mailto)
-  any = doc.at_css("a[href^='mailto:']")
-  return any['href'].sub(/^mailto:/i,'').strip if any
+  # 2) data-* / onclick hints in the block
+  cand = parse_email_from(collect_attr_candidates(cont))
+  return cand if cand
+
+  # 3) JS decoy link like #ff_javascript → render and re-scan same block
+  if (a = cont.at_css('a[href]')) && a['href'].to_s.include?('#ff_javascript')
+    html2 = http_get_rendered(page_url)
+    doc2  = Nokogiri::HTML(html2)
+    node2 = find_label_node(doc2, 'Email', 'Contact Email', 'Contact')
+    cont2 = small_container(node2)
+    if cont2
+      if (m2 = cont2.at_css("a[href^='mailto:']"))
+        return m2['href'].sub(/^mailto:/i,'').strip
+      end
+      cand2 = parse_email_from(collect_attr_candidates(cont2))
+      return cand2 if cand2
+      if (m3 = cont2.text.match(/[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}/i))
+        return m3[0]
+      end
+    end
+  end
 
   nil
 end
 
-def location_from_label(doc)
-  cont = container_for_label(doc, 'location')
-  value_text_from_container(cont, 'location')
-end
-
-def phone_from_label(doc)
-  cont = container_for_label(doc, 'phone')
-  val = value_text_from_container(cont, 'phone')
-  return val if val && !val.empty?
-
-  tel = cont&.at_css("a[href^='tel:']")
-  return tel.text.strip if tel
-
+def location_from_page(doc)
+  # Prefer an explicit “Location” label
+  node = find_label_node(doc, 'Location')
+  cont = small_container(node)
   if cont
-    m = cont.text.match(/(\+?\d[\d\-\s().]{6,}\d)/)
-    return m[1] if m
+    txt = cont.text.strip.gsub(/Location\s*[:\-–—]?\s*/i, '').gsub(/\s+/, ' ')
+    return txt unless looks_like_noise?(txt)
   end
 
+  # Fallback: some pages put address under “Contact” block
+  node2 = find_label_node(doc, 'Contact', 'Contact Email')
+  cont2 = small_container(node2)
+  if cont2
+    txt = cont2.text.strip
+    # Heuristics: keep the segment that looks like an address (city, region, postal, country)
+    # Canadian postal code pattern
+    if (m = txt.match(/([A-Za-z .'\-]+,\s*[A-Za-z .'\-]+(?:\s+[A-Z]{2,3})?)\s+(?:[A-Z]\d[A-Z]\s?\d[A-Z]\d)\s*(Canada|United States|USA|United Kingdom|UK)?/))
+      loc = [m[1], m[2]].compact.join(' ')
+      loc = loc.gsub(/\s+/, ' ').strip
+      return loc unless looks_like_noise?(loc)
+    end
+    # Simple "City, Region Country" fallback
+    if (m2 = txt.match(/([A-Za-z .'\-]+,\s*[A-Za-z .'\-]+(?:,\s*[A-Za-z .'\-]+)?)/))
+      loc2 = m2[1].gsub(/\s+/, ' ').strip
+      return loc2 unless looks_like_noise?(loc2)
+    end
+  end
+
+  nil
+end
+
+def phone_from_page(doc)
+  node = find_label_node(doc, 'Phone', 'Contact', 'Contact Email')
+  cont = small_container(node)
+  return nil unless cont
+  # visible text (not href)
+  if (t = cont.at_css("a[href^='tel:']"))
+    num = t.text.strip
+    return num unless looks_like_noise?(num)
+  end
+  if (m = cont.text.match(/(\+?\d[\d\-\s().]{6,}\d)/))
+    num = m[1].strip
+    return num unless looks_like_noise?(num)
+  end
   nil
 end
 
@@ -356,11 +350,17 @@ def scrape_festival(url)
   name = doc.at('h1')&.text&.strip
   name ||= doc.at('title')&.text&.strip
 
-  website  = website_from_label(doc, url)   # href inside "Website" block
-  email    = email_from_label(doc, url)     # from "Email" block (handles JS)
-  location = location_from_label(doc)       # visible text only
-  phone    = phone_from_label(doc)          # visible text only
-  director = director_guess(doc)            # best-effort text
+  website  = website_from_page(doc, url)
+  email    = email_from_page(doc, url)
+  location = location_from_page(doc)
+  phone    = phone_from_page(doc)
+  director = director_guess(doc)
+
+  # Final sanity
+  website  = nil if looks_like_noise?(website) || !website.to_s.start_with?('http')
+  email    = nil if looks_like_noise?(email)   || !(email.to_s.include?('@'))
+  location = nil if looks_like_noise?(location)
+  phone    = nil if looks_like_noise?(phone)
 
   upsert_row({
     source_url: url,
