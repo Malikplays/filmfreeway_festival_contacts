@@ -25,11 +25,9 @@ def db
         scraped_at INTEGER
       );
     SQL
-    # migrate if old table lacks 'phone'
+    # migrate if an older run lacked 'phone'
     cols = d.execute("PRAGMA table_info(festivals)").map { |r| r[1] }
-    unless cols.include?('phone')
-      d.execute("ALTER TABLE festivals ADD COLUMN phone TEXT")
-    end
+    d.execute("ALTER TABLE festivals ADD COLUMN phone TEXT") unless cols.include?('phone')
     d
   end
 end
@@ -63,7 +61,7 @@ end
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 OPEN_TIMEOUT = 15
 READ_TIMEOUT = 30
-PER_REQ_CAP  = (ENV['SCRAPER_TIMEOUT_SECS'] || "60").to_i  # hard cap per request
+PER_REQ_CAP  = (ENV['SCRAPER_TIMEOUT_SECS'] || "60").to_i
 
 def decompress(body, encoding)
   case (encoding || "").downcase
@@ -85,8 +83,7 @@ def http_get(url, referer: "https://filmfreeway.com/")
       return timed_request(target, referer: "https://filmfreeway.com/")
     rescue => e
       STDERR.puts "… #{mode} failed: #{e}"
-      # quick retry on throttling or timeout
-      if e.to_s =~ /HTTP (429|5\d\d)/ || e.to_s =~ /Timeout/
+      if e.to_s =~ /HTTP (429|5\d\d)|Timeout/
         sleep 1.0
         STDERR.puts "Retrying #{mode} once…"
         begin
@@ -95,7 +92,6 @@ def http_get(url, referer: "https://filmfreeway.com/")
           STDERR.puts "… retry failed: #{e2}"
         end
       end
-      # then fall through to next mode
     end
   end
   raise "failed to fetch #{url}"
@@ -119,7 +115,6 @@ def timed_request(target, referer:)
     h.open_timeout = OPEN_TIMEOUT
     h.read_timeout = READ_TIMEOUT
     res = h.request(req)
-    # Hard cap after the request returns (ScraperAPI does the heavy lifting)
     raise "Timeout after #{PER_REQ_CAP}s for #{uri}" if (Time.now - start) > PER_REQ_CAP
   end
 
@@ -132,125 +127,97 @@ def timed_request(target, referer:)
   body
 end
 
-# ========= Parsing helpers =========
-SOCIAL = %w[facebook.com twitter.com instagram.com youtube.com tiktok.com linkedin.com linktr.ee]
-
+# ========= Parsing helpers (label-precise) =========
 def absolute(base, href)
   return nil if href.nil? || href.empty?
   URI.join(base, href).to_s rescue href
 end
 
-# Prefer explicit "Website" / "Official" anchors, else first non-social external link on the page.
-def external_site_from(doc, base_url)
-  # Text-labeled website buttons/links
-  a = doc.at_xpath("//a[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'website') or contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'official')][@href]")
-  if a
-    full = absolute(base_url, a['href'].to_s)
-    return full if full&.start_with?('http') && !full.include?('filmfreeway.com') && SOCIAL.none? { |s| full.include?(s) }
+def at_link_by_text(doc, label)
+  # exact text match first, then contains, both case-insensitive
+  down = "translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')"
+  a = doc.at_xpath("//a[@href and #{down}='#{label.downcase}']")
+  a ||= doc.at_xpath("//a[@href and contains(#{down},'#{label.downcase}')]")
+  a
+end
+
+def value_next_to_label(doc, label)
+  # 1) dt -> dd
+  down = "translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')"
+  node = doc.at_xpath("//dt[#{down}='#{label.downcase}']/following-sibling::*[1]")
+  return node.text.strip if node
+
+  # 2) <strong>/<b>Label</strong> VALUE
+  node = doc.at_xpath("//*[self::strong or self::b][#{down}='#{label.downcase}']/following-sibling::text()[1]")
+  return node.text.strip if node && node.text
+
+  # 3) generic: element whose text is exactly the label, take next sibling element
+  label_node = doc.at_xpath("//*[self::div or self::span or self::p or self::li][#{down}='#{label.downcase}']")
+  if label_node
+    sib = label_node.xpath("following-sibling::*[1]").first
+    return sib.text.strip if sib
   end
-  # First sensible external link
-  doc.css('a[href]').each do |link|
-    href = link['href'].to_s
-    next if href.empty?
+
+  nil
+end
+
+def website_from_label(doc, base_url)
+  if (a = at_link_by_text(doc, 'website'))
+    href = a['href'].to_s
     full = absolute(base_url, href)
-    next unless full&.start_with?('http')
-    next if full.include?('filmfreeway.com') || SOCIAL.any? { |s| full.include?(s) }
-    return full
+    # only keep true external websites; do not keep socials/filmfreeway
+    return full if full&.start_with?('http') &&
+                   !full.include?('filmfreeway.com') &&
+                   %w[facebook.com twitter.com instagram.com youtube.com tiktok.com linkedin.com linktr.ee].none? { |s| full.include?(s) }
   end
   nil
 end
 
-def find_email_in(text)
-  text[/[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}/i]
-end
-
-def find_phone_in(text)
-  # Accepts +country, (), spaces, dashes; requires at least 7 digits total
-  m = text.match(/(\+?\d[\d\-\s().]{6,}\d)/)
-  m && m[1]
-end
-
-# JSON-LD (schema.org) often includes address/phone/url
-def extract_jsonld(doc)
-  blocks = []
-  doc.css('script[type="application/ld+json"]').each do |s|
-    begin
-      j = JSON.parse(s.text)
-      blocks.concat(Array(j))
-    rescue
-      next
-    end
+def email_from_label(doc)
+  if (a = at_link_by_text(doc, 'email'))
+    href = a['href'].to_s
+    return href.sub(/^mailto:/i,'').strip unless href.empty?
   end
-  blocks
+  # light fallback: any mailto on page
+  mail = doc.at_css("a[href^='mailto:']")
+  return mail['href'].sub(/^mailto:/i,'').strip if mail
+  nil
 end
 
-def location_from_jsonld(doc)
-  extract_jsonld(doc).each do |j|
-    # Look for Event/Organization with place/address
+def location_from_label(doc)
+  # Must return the visible text, not any URL
+  val = value_next_to_label(doc, 'location')
+  return val unless val.nil? || val.empty?
+  # fallback: JSON-LD location text if present
+  jl = doc.css('script[type="application/ld+json"]').map { |s| JSON.parse(s.text) rescue nil }.compact
+  jl = jl.is_a?(Array) ? jl.flatten : [jl]
+  jl.each do |j|
     loc = j['location'] || j['address']
-    next unless loc
-    # Various shapes: string, object, or nested
     if loc.is_a?(String)
       return loc.strip
     elsif loc.is_a?(Hash)
       parts = [loc['name'], loc['streetAddress'], loc['addressLocality'], loc['addressRegion'], loc['postalCode'], loc['addressCountry']].compact
       return parts.join(', ') unless parts.empty?
-    elsif loc.is_a?(Array)
-      loc.each do |o|
-        next unless o.is_a?(Hash)
-        parts = [o['name'], o['streetAddress'], o['addressLocality'], o['addressRegion'], o['postalCode'], o['addressCountry']].compact
-        return parts.join(', ') unless parts.empty?
-      end
     end
   end
   nil
 end
 
-def phone_from_jsonld(doc)
-  extract_jsonld(doc).each do |j|
-    tel = j['telephone'] || (j['contactPoint'] && j['contactPoint']['telephone'])
-    return tel if tel && !tel.to_s.empty?
-  end
-  nil
+def phone_from_label(doc)
+  # Must return the visible text (e.g., from a tel: link's text)
+  val = value_next_to_label(doc, 'phone')
+  return val unless val.nil? || val.empty?
+  # fallback: visible text inside a tel link (still text, not href)
+  tel = doc.at_css("a[href^='tel:']")
+  return tel.text.strip if tel
+  # fallback: regex on visible text
+  m = doc.text.match(/(\+?\d[\d\-\s().]{6,}\d)/)
+  m && m[1]
 end
 
-def location_from_labels(doc)
-  # Try label/value patterns like "Location", "Country", "City"
-  candidates = doc.xpath("//*[self::li or self::div or self::span][contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'location')]")
-                  .map { |n| n.text.strip }.uniq
-  # Pick the shortest reasonably informative line
-  candidates.sort_by!(&:length)
-  candidates.find { |t| t.split.size <= 12 && t.downcase.include?('location') } ||
-    candidates.first
-end
-
-# Fetch email/phone from external website (homepage or up to 2 contact-like pages)
-MAX_CONTACT_PAGES = 2
-def discover_contact_on_site(url)
-  return [nil, nil] unless url
-  html = http_get(url, referer: "https://filmfreeway.com/")
-  doc  = Nokogiri::HTML(html)
-
-  # direct mailto/phone on homepage
-  mail = doc.at_css("a[href^='mailto:']")&.[]('href')&.sub('mailto:','')
-  phone = find_phone_in(doc.text)
-
-  return [mail, phone] if mail || phone
-
-  links = doc.css('a[href]').map { |a| absolute(url, a['href'].to_s) }.compact.uniq
-  contactish = links.select { |u| u && u.downcase.match(/contact|about|team|imprint|kontakt|legal|impressum/) }
-  contactish.first(MAX_CONTACT_PAGES).each do |cl|
-    begin
-      txt = http_get(cl, referer: url)
-      mail2 = find_email_in(txt)
-      phone2 = find_phone_in(txt)
-      return [mail2, phone2] if mail2 || phone2
-    rescue
-      next
-    end
-  end
-
-  [find_email_in(html), find_phone_in(html)]
+def director_guess(doc)
+  doc.xpath("//*[contains(translate(.,'DIRECTOR','director'),'director')]")
+     .map { _1.text.strip }.find { |t| t =~ /director/i }
 end
 
 # ========= Festival scraping =========
@@ -258,27 +225,12 @@ def scrape_festival(url)
   html = http_get(url, referer: "https://filmfreeway.com/festivals")
   doc  = Nokogiri::HTML(html)
 
-  # Name
-  name = doc.at('h1')&.text&.strip || doc.at('title')&.text&.strip
-
-  # External website
-  website = external_site_from(doc, url)
-
-  # Director (best-effort)
-  director = doc.xpath("//*[contains(translate(.,'DIRECTOR','director'),'director')]")
-                .map { _1.text.strip }.find { |t| t =~ /director/i }
-
-  # Location & Phone: JSON-LD first, then visible labels
-  location = location_from_jsonld(doc) || location_from_labels(doc)
-  phone    = phone_from_jsonld(doc) || find_phone_in(doc.text)
-
-  # Email: mailto on page, else try external site
-  email = doc.at_css("a[href^='mailto:']")&.[]('href')&.sub('mailto:','')
-  if (!email || email.empty?) || (!phone || phone.empty?)
-    e2, p2 = discover_contact_on_site(website)
-    email ||= e2
-    phone ||= p2
-  end
+  name     = doc.at('h1')&.text&.strip || doc.at('title')&.text&.strip
+  website  = website_from_label(doc, url)         # URL of the "Website" link
+  email    = email_from_label(doc)                # email from the "Email" link's href
+  location = location_from_label(doc)             # visible text only
+  phone    = phone_from_label(doc)                # visible text only
+  director = director_guess(doc)                  # best-effort
 
   save_row({
     source_url: url,
