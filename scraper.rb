@@ -33,12 +33,12 @@ def ensure_table!
       phone      TEXT
     );
   SQL
-  # Migrate away old columns (e.g., scraped_at) if present
+
+  # migrate away any extra columns (e.g., scraped_at)
   cols = db.execute("PRAGMA table_info(festivals)").map { |r| r[1] }
   extra = cols - DESIRED_COLS
   if extra.any?
-    db.transaction
-    begin
+    db.transaction do
       db.execute <<-SQL
         CREATE TABLE IF NOT EXISTS festivals_new (
           source_url TEXT PRIMARY KEY,
@@ -50,16 +50,15 @@ def ensure_table!
           phone      TEXT
         );
       SQL
-      common = DESIRED_COLS & cols
-      db.execute("INSERT OR REPLACE INTO festivals_new (#{common.join(',')}) SELECT #{common.join(',')} FROM festivals")
+      common = (DESIRED_COLS & cols)
+      if common.any?
+        db.execute("INSERT OR REPLACE INTO festivals_new (#{common.join(',')}) SELECT #{common.join(',')} FROM festivals")
+      end
       db.execute("DROP TABLE festivals")
       db.execute("ALTER TABLE festivals_new RENAME TO festivals")
-      db.commit
-    rescue => e
-      db.rollback
-      warn "Migration failed: #{e}"
     end
   end
+
   db
 end
 
@@ -92,7 +91,9 @@ def scraperapi_url(target_url, mode: :no_render, country: 'us', session: 1001)
   uri.to_s
 end
 
-def mask_key(u); u.to_s.sub(/api_key=[^&]+/, 'api_key=***'); end
+def mask_key(u)
+  u.to_s.sub(/api_key=[^&]+/, 'api_key=***')
+end
 
 def decompress(body, encoding)
   case (encoding || "").downcase
@@ -135,7 +136,7 @@ def timed_request(target, referer:)
   body
 end
 
-# Try no-render first (faster), then render (JS)
+# Try no-render first (faster), then render (handles JS)
 def http_get(url, referer: "https://filmfreeway.com/")
   [:no_render, :render].each do |mode|
     target = scraperapi_url(url, mode: mode)
@@ -166,14 +167,16 @@ SOCIAL = %w[facebook.com twitter.com instagram.com youtube.com tiktok.com linked
 
 def absolute(base, href)
   return nil if href.nil? || href.empty?
-  URI.join(base, href).to_s rescue href
+  URI.join(base, href).to_s
+rescue
+  href
 end
 
 # Find the smallest useful container that holds a label and its value/controls
 def container_for_label(doc, label)
   down = "translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')"
 
-  # <dt>Label</dt> <dd> ... </dd>
+  # <dt>Label</dt> <dd>...</dd>
   dt = doc.at_xpath("//dt[#{down}='#{label.downcase}']")
   return dt.xpath("following-sibling::*[1]").first if dt
 
@@ -181,18 +184,48 @@ def container_for_label(doc, label)
   strong = doc.at_xpath("//*[self::strong or self::b][#{down}='#{label.downcase}']")
   return (strong.ancestors('li,div,section,p,dd').first || strong.parent) if strong
 
-  # generic element with exact label text → return its nearest container
+  # generic element with exact label text → return nearest container
   lbl = doc.at_xpath("//*[self::div or self::span or self::p or self::li][#{down}='#{label.downcase}']")
   return (lbl.ancestors('li,div,section,p,dd').first || lbl.parent) if lbl
 
   # final: any node that contains the word as a separate token
   contains = doc.at_xpath("//*[contains(#{down},'#{label.downcase}')]")
-  contains && (contains.ancestors('li,div,section,p,dd').first || contains.parent)
+  if contains
+    return contains.ancestors('li,div,section,p,dd').first || contains.parent
+  end
+
+  nil
 end
 
 # Visible text in the container, minus the label word itself
 def value_text_from_container(container, label)
   return nil unless container
   txt = container.text.strip
-  # remove the label word and trailing separators like ':' or '—'
   txt = txt.gsub(/#{Regexp.escape(label)}\s*[:\-–—]?\s*/i, '')
+  txt = txt.gsub(/\s+/, ' ').strip
+  txt.empty? ? nil : txt
+end
+
+# Find <a> by visible text (case-insensitive). Exact match then contains.
+def at_link_by_text(doc, label)
+  down = "translate(normalize-space(string(.)),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')"
+  doc.at_xpath("//a[@href and #{down}='#{label.downcase}']") ||
+    doc.at_xpath("//a[@href and contains(#{down},'#{label.downcase}')]")
+end
+
+# Extract URL/email from JS-y attributes when href is a placeholder
+def extract_url_from_attrs(node)
+  if node['onclick']
+    if node['onclick'] =~ /mailto:([^\s'")<>]+)/i
+      return "mailto:#{$1}"
+    end
+    if node['onclick'] =~ /https?:\/\/[^\s'"]+/i
+      return node['onclick'][/https?:\/\/[^\s'"]+/i]
+    end
+  end
+  %w[
+    data-clipboard-text data-email data-address data-mail data-mailto data-text data-value
+    data-copy data-copy-text data-contact data-user data-domain data-href data-url
+  ].each do |attr|
+    v = node[attr]
+    next unless
