@@ -1,3 +1,7 @@
 source 'https://rubygems.org'
-# Minimal: only sqlite3 so we can create data.sqlite for morph.io
-gem 'sqlite3', '1.3.10'
+
+# Match the runtime Heroku picked (your log showed ruby-3.0.3)
+ruby '3.0.3'
+
+# Use a sqlite3 that works with Ruby 3.x
+gem 'sqlite3', '~> 1.5'
