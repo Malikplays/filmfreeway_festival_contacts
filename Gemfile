@@ -1,3 +1,3 @@
 source 'https://rubygems.org'
-gem 'scraperwiki', git: 'https://github.com/openaustralia/scraperwiki-ruby.git', branch: 'morph_defaults'
-gem 'nokogiri'
+# Minimal: only sqlite3 so we can create data.sqlite for morph.io
+gem 'sqlite3', '1.3.10'
