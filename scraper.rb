@@ -335,8 +335,7 @@ end
 
 # ====== Run ======
 SEEDS = [
-  "https://filmfreeway.com/commffestglobalcommunityfilmfestival"
-"https://filmfreeway.com/commffestglobalcommunityfilmfestival"
+  "https://filmfreeway.com/commffestglobalcommunityfilmfestival",
 "https://filmfreeway.com/JAYU",
 "https://filmfreeway.com/ucff",
 "https://filmfreeway.com/kaffny",
