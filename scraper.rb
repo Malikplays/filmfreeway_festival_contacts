@@ -18,9 +18,11 @@ PER_REQ_CAP  = (ENV['SCRAPER_TIMEOUT_SECS'] || "60").to_i
 MORPH_SCRAPERAPI = ENV['MORPH_SCRAPERAPI'] or abort("Set MORPH_SCRAPERAPI in morph.io Secrets")
 
 # ====== DB ======
+DESIRED_COLS = %w[source_url name website email director location phone]
+
 def ensure_table!
-  d = SQLite3::Database.new(DB_FILE)
-  d.execute <<-SQL
+  db = SQLite3::Database.new(DB_FILE)
+  db.execute <<-SQL
     CREATE TABLE IF NOT EXISTS festivals (
       source_url TEXT PRIMARY KEY,
       name       TEXT,
@@ -31,7 +33,34 @@ def ensure_table!
       phone      TEXT
     );
   SQL
-  d
+  # Migrate away old columns (e.g., scraped_at) if present
+  cols = db.execute("PRAGMA table_info(festivals)").map { |r| r[1] }
+  extra = cols - DESIRED_COLS
+  if extra.any?
+    db.transaction
+    begin
+      db.execute <<-SQL
+        CREATE TABLE IF NOT EXISTS festivals_new (
+          source_url TEXT PRIMARY KEY,
+          name       TEXT,
+          website    TEXT,
+          email      TEXT,
+          director   TEXT,
+          location   TEXT,
+          phone      TEXT
+        );
+      SQL
+      common = DESIRED_COLS & cols
+      db.execute("INSERT OR REPLACE INTO festivals_new (#{common.join(',')}) SELECT #{common.join(',')} FROM festivals")
+      db.execute("DROP TABLE festivals")
+      db.execute("ALTER TABLE festivals_new RENAME TO festivals")
+      db.commit
+    rescue => e
+      db.rollback
+      warn "Migration failed: #{e}"
+    end
+  end
+  db
 end
 
 def db
@@ -41,8 +70,7 @@ end
 # Upsert using only existing columns
 def upsert_row(row_hash)
   cols_existing = db.execute("PRAGMA table_info(festivals)").map { |r| r[1] }
-  desired = %w[source_url name website email director location phone]
-  cols = desired & cols_existing
+  cols = DESIRED_COLS & cols_existing
   vals = cols.map { |c| row_hash[c.to_sym] }
   placeholders = (['?'] * cols.length).join(',')
   sql = "INSERT OR REPLACE INTO festivals (#{cols.join(',')}) VALUES (#{placeholders})"
@@ -141,183 +169,30 @@ def absolute(base, href)
   URI.join(base, href).to_s rescue href
 end
 
-# <a> by visible text (case-insensitive). Exact match first; then contains.
-def at_link_by_text(doc, label)
-  down = "translate(normalize-space(string(.)),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')"
-  doc.at_xpath("//a[@href and #{down}='#{label.downcase}']") ||
-    doc.at_xpath("//a[@href and contains(#{down},'#{label.downcase}')]")
-end
-
-# Value next to/under a label (dt->dd, <b>Label</b> Value, or next sibling)
-def value_next_to_label(doc, label)
+# Find the smallest useful container that holds a label and its value/controls
+def container_for_label(doc, label)
   down = "translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')"
-  n = doc.at_xpath("//dt[#{down}='#{label.downcase}']/following-sibling::*[1]")
-  return n.text.strip if n
 
-  n = doc.at_xpath("//*[self::strong or self::b][#{down}='#{label.downcase}']/following-sibling::text()[1]")
-  return n.text.strip if n && n.text
+  # <dt>Label</dt> <dd> ... </dd>
+  dt = doc.at_xpath("//dt[#{down}='#{label.downcase}']")
+  return dt.xpath("following-sibling::*[1]").first if dt
 
+  # <strong>/<b>Label</strong> VALUE
+  strong = doc.at_xpath("//*[self::strong or self::b][#{down}='#{label.downcase}']")
+  return (strong.ancestors('li,div,section,p,dd').first || strong.parent) if strong
+
+  # generic element with exact label text → return its nearest container
   lbl = doc.at_xpath("//*[self::div or self::span or self::p or self::li][#{down}='#{label.downcase}']")
-  if lbl
-    sib = lbl.xpath("following-sibling::*[1]").first
-    return sib.text.strip if sib
-  end
-  nil
+  return (lbl.ancestors('li,div,section,p,dd').first || lbl.parent) if lbl
+
+  # final: any node that contains the word as a separate token
+  contains = doc.at_xpath("//*[contains(#{down},'#{label.downcase}')]")
+  contains && (contains.ancestors('li,div,section,p,dd').first || contains.parent)
 end
 
-# Extract URL/email from JS-y attributes when href is a placeholder
-def extract_url_from_attrs(node)
-  if node['onclick']
-    return "mailto:#{$1}" if node['onclick'] =~ /mailto:([^\s'")<>]+)/i
-    return $& if node['onclick'] =~ /https?:\/\/[^\s'"]+/i
-  end
-  %w[
-    data-clipboard-text data-email data-address data-mail data-mailto data-text data-value
-    data-copy data-copy-text data-contact data-user data-domain data-href data-url
-  ].each do |attr|
-    v = node[attr]
-    next unless v && !v.empty?
-    return "mailto:#{v}" if v =~ /\A[^@\s]+@[^@\s]+\.[^@\s]+\z/
-    return v if v =~ /\Ahttps?:\/\//i
-  end
-  nil
-end
-
-def website_from_label(doc, base_url)
-  a = at_link_by_text(doc, 'website')
-  return nil unless a
-  href = extract_url_from_attrs(a) || a['href'].to_s
-  full = absolute(base_url, href)
-  return nil unless full && full.start_with?('http')
-  return nil if full.include?('filmfreeway.com') || SOCIAL.any? { |s| full.include?(s) }
-  full
-end
-
-def email_from_label(doc, page_url)
-  a = at_link_by_text(doc, 'email')
-  return nil unless a
-
-  collect_candidates = lambda do |node|
-    vals = []
-    vals << node['href'] if node['href']
-    vals << node['onclick'] if node['onclick']
-    %w[
-      data-clipboard-text data-email data-address data-mail data-mailto data-text data-value
-      data-copy data-copy-text data-contact data-user data-domain data-href data-url
-    ].each { |k| v = node[k]; vals << v if v && !v.empty? }
-    node.xpath(".//*[@*]").each { |n| n.attribute_nodes.each { |att| vals << att.value if att.value && !att.value.empty? } }
-    node.xpath(".. | ../..").each { |n| n.attribute_nodes.each { |att| vals << att.value if att.value && !att.value.empty? } }
-    vals.compact.uniq
-  end
-
-  parse_email = lambda do |strings|
-    strings.each do |s|
-      return $1.strip if s =~ /mailto:([^\s'")<>]+)/i
-      if (m = s[/[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}/i])
-        return m.strip
-      end
-    end
-    nil
-  end
-
-  # 1) as-is
-  email = parse_email.call(collect_candidates.call(a))
-
-  # 2) if it's the JS decoy (#ff_javascript) or still empty, force-render and retry
-  if (!email || email.empty?) && a['href'].to_s.include?('#ff_javascript')
-    html2 = http_get_rendered(page_url)
-    doc2  = Nokogiri::HTML(html2)
-    a2    = at_link_by_text(doc2, 'email')
-    email = parse_email.call(collect_candidates.call(a2)) if a2
-    if (!email || email.empty?) && a2
-      block_html = (a2.ancestors("section,div,li,dl").first || doc2).to_html
-      email = block_html[/mailto:([^\s'"<>]+)/i, 1] ||
-              block_html[/[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}/i]
-    end
-  end
-
-  email
-end
-
-def location_from_label(doc)
-  val = value_next_to_label(doc, 'location')
-  return val unless val.nil? || val.empty?
-
-  # tiny fallback: JSON-LD address text (never a URL)
-  doc.css('script[type="application/ld+json"]').each do |s|
-    begin
-      j = JSON.parse(s.text)
-      arr = j.is_a?(Array) ? j : [j]
-      arr.each do |obj|
-        loc = obj['location'] || obj['address']
-        if loc.is_a?(String)
-          return loc.strip
-        elsif loc.is_a?(Hash)
-          parts = [loc['name'], loc['streetAddress'], loc['addressLocality'], loc['addressRegion'], loc['postalCode'], loc['addressCountry']].compact
-          return parts.join(', ') unless parts.empty?
-        end
-      end
-    rescue
-      next
-    end
-  end
-  nil
-end
-
-def phone_from_label(doc)
-  val = value_next_to_label(doc, 'phone')
-  return val unless val.nil? || val.empty?
-  tel = doc.at_css("a[href^='tel:']")
-  return tel.text.strip if tel
-  if (m = doc.text.match(/(\+?\d[\d\-\s().]{6,}\d)/))
-    return m[1]
-  end
-  nil
-end
-
-def director_guess(doc)
-  doc.xpath("//*[contains(translate(.,'DIRECTOR','director'),'director')]")
-     .map { _1.text.strip }.find { |t| t =~ /director/i }
-end
-
-# ====== Scrape one festival page ======
-def scrape_festival(url)
-  html = http_get(url, referer: "https://filmfreeway.com/festivals")
-  doc  = Nokogiri::HTML(html)
-
-  name = doc.at('h1')&.text&.strip
-  name ||= doc.at('title')&.text&.strip
-
-  website  = website_from_label(doc, url)   # href of "Website"
-  email    = email_from_label(doc, url)     # email from "Email" (handles JS)
-  location = location_from_label(doc)       # visible text only
-  phone    = phone_from_label(doc)          # visible text only
-  director = director_guess(doc)            # best-effort text
-
-  upsert_row({
-    source_url: url,
-    name: name,
-    website: website,
-    email: email,
-    director: director,
-    location: location,
-    phone: phone
-  })
-end
-
-# ====== Run (replace SEEDS with your list) ======
-SEEDS = [
-  "https://filmfreeway.com/CommffestGlobalCommunityFilmFestival"
-]
-
-SEEDS.each do |u|
-  begin
-    scrape_festival(u)
-    puts "OK #{u}"
-    sleep 1
-  rescue => e
-    warn "FAIL #{u} -> #{e}"
-  end
-end
-
-puts "done"
+# Visible text in the container, minus the label word itself
+def value_text_from_container(container, label)
+  return nil unless container
+  txt = container.text.strip
+  # remove the label word and trailing separators like ':' or '—'
+  txt = txt.gsub(/#{Regexp.escape(label)}\s*[:\-–—]?\s*/i, '')
