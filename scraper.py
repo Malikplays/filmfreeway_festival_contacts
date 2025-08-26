@@ -1,5 +1,5 @@
 import time
-import scraperwiki  # writes to ./data.sqlite automatically
+import scraperwiki  # creates ./data.sqlite on save
 
 row = {
     "source_url": "https://filmfreeway.com/ExampleFestival",
@@ -11,6 +11,5 @@ row = {
     "scraped_at": int(time.time()),
 }
 
-# Create/append and upsert by source_url (this creates data.sqlite if missing)
 scraperwiki.sqlite.save(unique_keys=["source_url"], data=row)
 print("Wrote 1 test row to data.sqlite")
