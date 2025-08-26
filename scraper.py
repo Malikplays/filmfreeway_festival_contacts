@@ -1,14 +1,8 @@
+# scraper.py (root)
 import time, sqlite3
 conn = sqlite3.connect('data.sqlite')
-cur  = conn.cursor()
-cur.execute("""CREATE TABLE IF NOT EXISTS festivals(
-  source_url TEXT PRIMARY KEY, name TEXT, website TEXT,
-  email TEXT, director TEXT, location TEXT, scraped_at INTEGER)""")
-cur.execute("""INSERT OR REPLACE INTO festivals
-  (source_url,name,website,email,director,location,scraped_at)
-  VALUES (?,?,?,?,?,?,?)""",
-  ("https://filmfreeway.com/ExampleFestival","Example Festival",
-   "https://examplefest.org","info@examplefest.org","Jane Doe",
-   "City, Country", int(time.time())))
+c = conn.cursor()
+c.execute("""CREATE TABLE IF NOT EXISTS data(name TEXT PRIMARY KEY, t INTEGER)""")
+c.execute("INSERT OR REPLACE INTO data(name,t) VALUES(?,?)", ("ping", int(time.time())))
 conn.commit(); conn.close()
-print("Wrote 1 test row to data.sqlite")
+print("ok: wrote row to data.sqlite")
