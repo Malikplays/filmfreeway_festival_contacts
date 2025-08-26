@@ -14,7 +14,7 @@ OPEN_TIMEOUT = 15
 READ_TIMEOUT = 30
 PER_REQ_CAP  = (ENV['SCRAPER_TIMEOUT_SECS'] || "60").to_i
 
-# Require key from morph.io Secrets (renamed env var)
+# Require key from morph.io Secrets
 MORPH_SCRAPERAPI = ENV['MORPH_SCRAPERAPI'] or abort("Set MORPH_SCRAPERAPI in morph.io Secrets")
 
 # ====== DB ======
@@ -285,8 +285,9 @@ def scrape_festival(url)
   html = http_get(url, referer: "https://filmfreeway.com/festivals")
   doc  = Nokogiri::HTML(html)
 
-  name     = doc.at('h1')&.text&; name = name.strip if name
-  name   ||= doc.at('title')&.text&.strip
+  name = doc.at('h1')&.text&.strip
+  name ||= doc.at('title')&.text&.strip
+
   website  = website_from_label(doc, url)   # href of "Website"
   email    = email_from_label(doc, url)     # email from "Email" (handles JS)
   location = location_from_label(doc)       # visible text only
