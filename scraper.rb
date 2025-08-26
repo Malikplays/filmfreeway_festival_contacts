@@ -32,7 +32,7 @@ def ensure_table!
     );
   SQL
 
-  # Remove legacy/extra columns
+  # Remove any legacy columns
   cols_now   = db.execute("PRAGMA table_info(festivals)").map { |r| r[1] }
   extra_cols = cols_now - DESIRED_COLS
   if extra_cols.any?
@@ -152,8 +152,6 @@ def http_get_rendered(url)
 end
 
 # ====== DOM helpers ======
-SOCIAL          = %w[facebook.com twitter.com instagram.com youtube.com tiktok.com linkedin.com linktr.ee]
-MAP_HOSTS       = %w[google.com maps.google.com goo.gl bing.com mapbox.com openstreetmap.org]
 BLOCKY_CLASSES  = /(Modal|modal|Overlay|Dialog|Signup|Login|StrongPassword|cookie|vex_)/i
 
 def absolute(base, href)
@@ -191,58 +189,18 @@ def looks_like_noise?(s)
   false
 end
 
-def sanitize_website(u)
-  return nil unless u && u.start_with?('http')
-  host = URI(u).host rescue nil
-  return nil unless host
-  return nil if host.include?('filmfreeway.com')
-  return nil if MAP_HOSTS.any? { |m| host.include?(m) }
-  return nil if SOCIAL.any? { |s| host.include?(s) }
-  u
-end
-
-# ====== WEBSITE ======
-# Primary rule: anchor with title="Visit website"
+# ====== WEBSITE (exact href from title="Visit website") ======
 def website_from_page(doc, page_url)
-  # Priority 1: exact title
+  # Priority 1: exact title="Visit website"
   a = doc.at_css("a[title='Visit website'][href]")
-  # Priority 1b: case-insensitive contains on title / aria-label
+  # Priority 1b: case-insensitive contains on @title / @aria-label
   a ||= doc.at_xpath("//a[@href and contains(translate(@title,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'visit website')]")
   a ||= doc.at_xpath("//a[@href and contains(translate(@aria-label,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'visit website')]")
+  # Priority 2: visible text equals "Website"
+  a ||= doc.at_xpath("//a[@href and normalize-space(translate(string(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'))='website']")
 
-  if a
-    href = sanitize_website(absolute(page_url, a['href'].to_s))
-    return href if href
-  end
-
-  # Priority 2: visible text "Website"
-  a2 = doc.at_xpath("//a[@href and normalize-space(translate(string(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'))='website']")
-  if a2
-    href = sanitize_website(absolute(page_url, a2['href'].to_s))
-    return href if href
-  end
-
-  # Priority 3: within a container labeled Website/Contact
-  node = find_label_node(doc, 'Website', 'Official website', 'Contact')
-  cont = small_container(node)
-  if cont
-    cont.css('a[href]').each do |aa|
-      t = [aa.text, aa['title'], aa['aria-label']].compact.join(' ').downcase
-      next unless t.include?('website') || t.include?('visit')
-      href = sanitize_website(absolute(page_url, aa['href'].to_s))
-      return href if href
-    end
-  end
-
-  # Priority 4: hero buttons / generic anchors that look like a website link
-  doc.css("a[href][target='_blank'], a[href][rel*='nofollow']").each do |aa|
-    t = [aa.text, aa['title'], aa['aria-label'], aa['data-tooltip']].compact.join(' ').downcase
-    next unless t.include?('website') || t.include?('official') || t.include?('visit')
-    href = sanitize_website(absolute(page_url, aa['href'].to_s))
-    return href if href
-  end
-
-  nil
+  return nil unless a
+  absolute(page_url, a['href'].to_s) # return the exact href (fbclid/utm preserved)
 end
 
 # ====== LOCATION (visible address text only) ======
@@ -260,20 +218,13 @@ def text_only_from(node)
   txt.empty? ? nil : txt
 end
 
-def location_from_page(doc, page_url)
+def location_from_page(doc)
   node = find_label_node(doc, 'Location')
   cont = small_container(node)
 
   candidates = []
   if cont
-    if cont.at_css("a[href*='maps.google.'], a[href*='google.com/maps']")
-      candidates << text_only_from(cont)
-      map_a = cont.at_css("a[href*='maps.google.'], a[href*='google.com/maps']")
-      prev_txt = (map_a && map_a.previous_sibling && map_a.previous_sibling.text) ? map_a.previous_sibling.text.strip : nil
-      candidates << prev_txt
-    else
-      candidates << text_only_from(cont)
-    end
+    candidates << text_only_from(cont)
   end
 
   # Fallback: sometimes address is under Contact
@@ -282,8 +233,9 @@ def location_from_page(doc, page_url)
   candidates << text_only_from(cont2) if cont2
 
   candidates.compact!
+  # remove phone-like strings
   candidates.map! { |t| t.gsub(/\+?\d[\d\-\s().]{6,}\d/, '').gsub(/\s+/, ' ').strip }
-  pick = candidates.find { |t| t =~ /\d/ && t =~ /(st|street|ave|avenue|rd|road|blvd|square|plaza|drive|dr|suite|#|zip|postal|ont|canada|usa|uk|city|toronto|m[0-9][a-z]\s?[0-9][a-z][0-9])\b/i }
+  pick = candidates.find { |t| t =~ /\d/ && t =~ /(st|street|ave|avenue|rd|road|blvd|square|plaza|drive|dr|suite|#|zip|postal|m[0-9][a-z]\s?[0-9][a-z][0-9]|canada|usa|uk|city|toronto)\b/i }
   pick ||= candidates.find { |t| t.length.between?(10, 200) }
   return nil if pick && pick.length > 220
   pick
@@ -313,11 +265,11 @@ def scrape_festival(url)
   name = doc.at('h1')&.text&.strip
   name ||= doc.at('title')&.text&.strip
 
-  website  = website_from_page(doc, url)   # href of title="Visit website" (with fallbacks)
-  location = location_from_page(doc, url)  # address text only
+  website  = website_from_page(doc, url)   # exact href from "Visit website"
+  location = location_from_page(doc)       # address text only
   phone    = phone_from_page(doc)
 
-  website  = nil if looks_like_noise?(website) || !website.to_s.start_with?('http')
+  website  = nil if looks_like_noise?(website)
   location = nil if looks_like_noise?(location)
   phone    = nil if looks_like_noise?(phone)
 
@@ -332,7 +284,10 @@ end
 
 # ====== Run ======
 SEEDS = [
-  "https://filmfreeway.com/CommffestGlobalCommunityFilmFestival"
+  # Example: Commffest
+  "https://filmfreeway.com/CommffestGlobalCommunityFilmFestival",
+  # Example you mentioned with title="Visit website"
+  "https://filmfreeway.com/InternationalMediaFestivalOfWales"
 ]
 
 SEEDS.each do |u|
