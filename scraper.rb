@@ -14,7 +14,7 @@ OPEN_TIMEOUT = 15
 READ_TIMEOUT = 30
 PER_REQ_CAP  = (ENV['SCRAPER_TIMEOUT_SECS'] || "60").to_i
 
-# morph.io Secret
+# morph.io Secret (Settings → Secrets)
 MORPH_SCRAPERAPI = ENV['MORPH_SCRAPERAPI'] or abort("Set MORPH_SCRAPERAPI in morph.io Secrets")
 
 # ====== DB ======
@@ -34,6 +34,7 @@ def ensure_table!
     );
   SQL
 
+  # Drop any unexpected columns (e.g., old scraped_at) by recreating the table
   cols  = db.execute("PRAGMA table_info(festivals)").map { |r| r[1] }
   extra = cols - DESIRED_COLS
   if extra.any?
@@ -59,3 +60,10 @@ def ensure_table!
   end
   db
 end
+
+def db
+  @db ||= ensure_table!
+end
+
+def upsert_row(row_hash)
+  cols_existing = db.execute("PRAGMA table_info(festivals)").map { |r| r[1] }
