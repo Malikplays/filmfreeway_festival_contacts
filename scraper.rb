@@ -14,36 +14,36 @@ OPEN_TIMEOUT = 15
 READ_TIMEOUT = 30
 PER_REQ_CAP  = (ENV['SCRAPER_TIMEOUT_SECS'] || "60").to_i
 
-# morph.io Secret (Settings → Secrets)
+# morph.io Secret (ScraperAPI)
 MORPH_SCRAPERAPI = ENV['MORPH_SCRAPERAPI'] || abort("Set MORPH_SCRAPERAPI in morph.io Secrets")
 
 # ====== DB ======
-DESIRED_COLS = %w[source_url name website location phone]
+DESIRED_COLS = %w[source_url festival_id name location phone]
 
 def ensure_table!
   db = SQLite3::Database.new(DB_FILE)
   db.execute <<-SQL
     CREATE TABLE IF NOT EXISTS festivals (
-      source_url TEXT PRIMARY KEY,
-      name       TEXT,
-      website    TEXT,
-      location   TEXT,
-      phone      TEXT
+      source_url  TEXT PRIMARY KEY,
+      festival_id TEXT,
+      name        TEXT,
+      location    TEXT,
+      phone       TEXT
     );
   SQL
 
-  # Remove legacy/extra columns if present
+  # Migrate away any legacy columns (e.g., website, email, director, scraped_at)
   cols_now   = db.execute("PRAGMA table_info(festivals)").map { |r| r[1] }
   extra_cols = cols_now - DESIRED_COLS
   if extra_cols.any?
     db.transaction do
       db.execute <<-SQL
         CREATE TABLE IF NOT EXISTS festivals_new (
-          source_url TEXT PRIMARY KEY,
-          name       TEXT,
-          website    TEXT,
-          location   TEXT,
-          phone      TEXT
+          source_url  TEXT PRIMARY KEY,
+          festival_id TEXT,
+          name        TEXT,
+          location    TEXT,
+          phone       TEXT
         );
       SQL
       common = (DESIRED_COLS & cols_now)
@@ -54,6 +54,7 @@ def ensure_table!
       db.execute("ALTER TABLE festivals_new RENAME TO festivals")
     end
   end
+
   db
 end
 
@@ -146,16 +147,8 @@ def http_get(url, referer: nil)
   raise "failed to fetch #{url}"
 end
 
-# ====== DOM helpers ======
+# ====== DOM helpers for location/phone ======
 BLOCKY_CLASSES = /(Modal|modal|Overlay|Dialog|Signup|Login|StrongPassword|cookie|vex_)/i
-SOCIAL_HOSTS   = %w[facebook.com fb.me twitter.com t.co x.com instagram.com youtube.com youtu.be tiktok.com linkedin.com linktr.ee]
-
-def absolute(base, href)
-  return nil if href.nil? || href.empty?
-  URI.join(base, href).to_s
-rescue
-  href
-end
 
 def small_container(node)
   return nil unless node
@@ -185,146 +178,6 @@ def looks_like_noise?(s)
   false
 end
 
-def external_url?(url)
-  return false if url.nil? || url.empty?
-  return false unless url =~ %r{\Ahttps?://}i
-  host = URI(url).host.to_s.downcase rescue ''
-  return false if host.include?('filmfreeway.com')
-  return false if SOCIAL_HOSTS.any? { |s| host.end_with?(s) || host.include?(s) }
-  true
-end
-
-# Pull any http(s) URL from attributes/text near a node
-def any_url_from_node(node)
-  return nil unless node
-  strings = []
-
-  # attributes on node + descendants + ancestors (small vicinity)
-  (node.attribute_nodes rescue []).each { |att| strings << att.value.to_s }
-  node.traverse do |n|
-    (n.attribute_nodes rescue []).each { |att| strings << att.value.to_s }
-    strings << n.text.to_s if n.text?
-  end
-  anc = node.ancestors.take(3)
-  anc.each do |n|
-    (n.attribute_nodes rescue []).each { |att| strings << att.value.to_s }
-  end
-
-  # also scan inline scripts inside the same container
-  sc = node.css('script').map(&:text)
-  strings.concat(sc)
-
-  strings.each do |s|
-    s.scan(%r{https?://[^\s"'<>)]{4,}}i).each do |u|
-      return u if external_url?(u)
-    end
-  end
-  nil
-end
-
-# ====== WEBSITE (extract even when href is #ff_javascript) ======
-def website_from_page(doc, page_url, rendered_doc: nil)
-  # 1) Prefer the same row/container that includes the globe icon
-  globe = doc.at_css("span.icon.icon-globe") || doc.at_xpath("//span[contains(@class,'icon') and contains(@class,'icon-globe')]")
-  rows  = []
-  rows << (small_container(globe) || globe&.parent) if globe
-  rows.compact!
-
-  # Add a second candidate row: any row that contains the exact "Visit website" anchor
-  direct_anchor = doc.at_css("a[title='Visit website']") ||
-                  doc.at_xpath("//a[contains(translate(@title,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'visit website')]")
-  rows << (small_container(direct_anchor) || direct_anchor&.parent) if direct_anchor
-  rows.uniq!
-
-  # helper to pick from a row
-  pick_from_row = lambda do |row|
-    next nil unless row
-    # First choice: <a title='Visit website' href=real>
-    a = row.at_css("a[title='Visit website'][href]") ||
-        row.at_xpath(".//a[@href and contains(translate(@title,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'visit website')]") ||
-        row.at_xpath(".//a[@href and normalize-space(translate(string(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'))='website']")
-    if a
-      href = a['href'].to_s
-      return absolute(page_url, href) if external_url?(absolute(page_url, href))
-      # If it's a JS placeholder, mine nearby data
-      if href.include?('#ff_javascript') || href.start_with?('javascript:')
-        # look for explicit external links within the same row
-        row.css('a[href]').each do |aa|
-          h = absolute(page_url, aa['href'].to_s)
-          return h if external_url?(h)
-        end
-        # look in attributes / inline scripts around this row
-        mined = any_url_from_node(row)
-        return mined if external_url?(mined)
-      end
-    end
-
-    # If no obvious anchor, scan all links in the row for an external non-social URL
-    row.css('a[href]').each do |aa|
-      h = absolute(page_url, aa['href'].to_s)
-      return h if external_url?(h)
-    end
-
-    # mining
-    mined = any_url_from_node(row)
-    return mined if external_url?(mined)
-
-    nil
-  end
-
-  rows.each do |row|
-    h = pick_from_row.call(row)
-    return h if external_url?(h)
-  end
-
-  # 2) Global fallback on unrendered DOM
-  a = doc.at_css("a[title='Visit website'][href]") ||
-      doc.at_xpath("//a[@href and contains(translate(@title,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'visit website')]") ||
-      doc.at_xpath("//a[@href and normalize-space(translate(string(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'))='website']")
-  if a
-    href = absolute(page_url, a['href'].to_s)
-    return href if external_url?(href)
-    # mine around it
-    mined = any_url_from_node(small_container(a) || a.parent || a)
-    return mined if external_url?(mined)
-  end
-
-  # 3) JSON-LD fallback
-  doc.css('script[type="application/ld+json"]').each do |s|
-    begin
-      j = JSON.parse(s.text)
-      objs = j.is_a?(Array) ? j : [j]
-      objs.each do |o|
-        urls = []
-        urls << o['url'] if o['url'].is_a?(String)
-        if o['sameAs'].is_a?(Array)
-          urls.concat(o['sameAs'].select { |x| x.is_a?(String) })
-        end
-        urls.each { |u| return u if external_url?(u) }
-      end
-    rescue
-      next
-    end
-  end
-
-  # 4) If we have a rendered document, try the same logic there
-  if rendered_doc
-    h = website_from_page(rendered_doc, page_url, rendered_doc: nil)
-    return h if h
-  end
-
-  # 5) Brutal fallback: scan whole doc for first external non-social link
-  doc.css('a[href]').each do |aa|
-    h = absolute(page_url, aa['href'].to_s)
-    return h if external_url?(h)
-  end
-  any = any_url_from_node(doc)
-  return any if external_url?(any)
-
-  nil
-end
-
-# ====== LOCATION (visible address text only) ======
 LABEL_WORDS    = ['Website','Facebook','Instagram','Twitter','X','Email','View Map','Contact']
 LABEL_WORDS_RE = Regexp.union(LABEL_WORDS.map { |w| /#{Regexp.escape(w)}/i })
 
@@ -342,25 +195,22 @@ end
 def location_from_page(doc)
   node = find_label_node(doc, 'Location')
   cont = small_container(node)
-
   candidates = []
   candidates << text_only_from(cont) if cont
 
-  # Sometimes address sits under "Contact"
+  # Sometimes address is under Contact block
   node2 = find_label_node(doc, 'Contact', 'Contact Email')
   cont2 = small_container(node2)
   candidates << text_only_from(cont2) if cont2
 
   candidates.compact!
-  # remove phone-like strings
-  candidates.map! { |t| t.gsub(/\+?\d[\d\-\s().]{6,}\d/, '').gsub(/\s+/, ' ').strip }
+  candidates.map! { |t| t.gsub(/\+?\d[\d\-\s().]{6,}\d/, '').gsub(/\s+/, ' ').strip } # remove phone-like text
   pick = candidates.find { |t| t =~ /\d/ && t =~ /(st|street|ave|avenue|rd|road|blvd|square|plaza|drive|dr|suite|#|zip|postal|m[0-9][a-z]\s?[0-9][a-z][0-9]|canada|usa|uk|city|toronto)\b/i }
   pick ||= candidates.find { |t| t.length.between?(10, 200) }
   return nil if pick && pick.length > 220
   pick
 end
 
-# ====== PHONE ======
 def phone_from_page(doc)
   node = find_label_node(doc, 'Phone', 'Contact', 'Contact Email')
   cont = small_container(node)
@@ -376,37 +226,55 @@ def phone_from_page(doc)
   nil
 end
 
+# ====== FESTIVAL ID ======
+def festival_id_from(doc, raw_html)
+  # 1) Straight attribute on any element
+  if (n = doc.at_css("[data-festival-id]"))
+    v = n['data-festival-id'].to_s.strip
+    return v if v =~ /^\d+$/
+  end
+
+  # 2) Regex on raw HTML
+  if raw_html && (m = raw_html.match(/data-festival-id\s*=\s*["'](\d+)["']/i))
+    return m[1]
+  end
+
+  # 3) Look inside scripts for JSON keys
+  doc.css('script').each do |s|
+    txt = s.text
+    if (m = txt.match(/"festival_id"\s*:\s*"?(\d+)"?/i))
+      return m[1]
+    end
+    if (m = txt.match(/festivalId\s*[:=]\s*"?(\d+)"?/i))
+      return m[1]
+    end
+  end
+
+  nil
+end
+
 # ====== Scrape one festival page ======
 def scrape_festival(url)
   html = http_get(url, referer: "https://filmfreeway.com/festivals")
   doc  = Nokogiri::HTML(html)
 
-  # Try rendered too, in case the website link is JS-injected
-  begin
-    html_r = timed_request(scraperapi_url(url, mode: :render), referer: "https://filmfreeway.com/festivals")
-    doc_r  = Nokogiri::HTML(html_r)
-  rescue => e
-    STDERR.puts "Rendered fetch failed (continuing with unrendered): #{e}"
-    doc_r = nil
-  end
-
   name = doc.at('h1')&.text&.strip
   name ||= doc.at('title')&.text&.strip
 
-  website  = website_from_page(doc, url, rendered_doc: doc_r)
-  location = location_from_page(doc)
-  phone    = phone_from_page(doc)
+  festival_id = festival_id_from(doc, html)
+  location    = location_from_page(doc)
+  phone       = phone_from_page(doc)
 
-  website  = nil if looks_like_noise?(website)
-  location = nil if looks_like_noise?(location)
-  phone    = nil if looks_like_noise?(phone)
+  festival_id = nil if looks_like_noise?(festival_id)
+  location    = nil if looks_like_noise?(location)
+  phone       = nil if looks_like_noise?(phone)
 
   upsert_row({
-    source_url: url,
-    name: name,
-    website: website,
-    location: location,
-    phone: phone
+    source_url:  url,
+    festival_id: festival_id,
+    name:        name,
+    location:    location,
+    phone:       phone
   })
 end
 
